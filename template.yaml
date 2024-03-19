@@ -1,0 +1,203 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Simple example of running dlt as a job in Fargate
+Parameters:
+  VPC:
+    Description: The VPC to deploy all this in to. We could conditionally set this up to manage it for us...
+    Type: AWS::EC2::VPC::Id
+  SubnetA:
+    Description: A subnet to deploy in to.
+    Type: AWS::EC2::Subnet::Id
+  SubnetB:
+    Description: A subnet to deploy in to. Hopefully in a different region than SubnetA.
+    Type: AWS::EC2::Subnet::Id
+  Environment:
+    Description: The environment for this stack.
+    Type: String
+    Default: "development"
+  ImageName:
+    Type: String
+    Default: bradhe/my-container:latest
+  DockerHubCredentials:
+    Type: String
+  StackType:
+    Type: String
+    Default: dlt-executor
+
+Resources:
+  #
+  # Access controls
+  #
+  SecretsManagementPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Allows access to read secrets.
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "secretsmanager:GetSecretValue"
+            Resource:
+              - !Ref DockerHubCredentials
+
+  ServicePolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      Description: Allows access to the various resources for this service.
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              # TODO: List access to other resources and APIs in this policy.
+              - "iam:*"
+            Resource:
+              - "*"
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-execution-role"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+                - events.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+        - !Ref SecretsManagementPolicy
+        - !Ref ServicePolicy
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Stack-Type
+          Value: !Ref StackType
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-task-role"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+                - events.amazonaws.com
+            Action: 'sts:AssumeRole'
+          - Effect: Allow
+            Principal:
+              AWS: "*"
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Ref ServicePolicy
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Stack-Type
+          Value: !Ref StackType
+
+  AutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-auto-scaling-role"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Stack-Type
+          Value: !Ref StackType
+
+  #
+  # CloudWatch
+  #
+  ServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${AWS::StackName}/Service'
+
+  #
+  # ECS
+  #
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-cluster"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Stack-Type
+          Value: !Ref StackType
+  
+  ETLTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-job"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 256
+      Memory: 0.5GB
+      ExecutionRoleArn: !Ref ExecutionRole
+      TaskRoleArn: !Ref TaskRole
+      ContainerDefinitions:
+        - Name: !Sub "${AWS::StackName}-job"
+          Image: !Ref ImageName
+          Command
+            # TODO: Set this up?
+            - "/usr/bin/command-to-invoke"
+          RepositoryCredentials:
+            CredentialsParameter: !Ref DockerHubCredentials
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref ServiceLogGroup
+              awslogs-stream-prefix: ecs
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Stack-Type
+          Value: !Ref StackType
+
+  #
+  # Security groups
+  #
+  ContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AWS::StackName} containers"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8081
+          ToPort: 8081
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 8082
+          ToPort: 8082
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Stack-Type
+          Value: !Ref StackType
+
+Outputs:
+  ContainerSecurityGroup:
+    Description: Security group for containers
+    Value: !Ref ContainerSecurityGroup
+
+  TaskRoleArn:
+    Description: Role that is used for launched infrastructure by the service.
+    Value: !GetAtt TaskRole.Arn
